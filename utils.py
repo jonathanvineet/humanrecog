@@ -1,4 +1,16 @@
 import datetime
+import requests
+
+def get_current_location():
+    try:
+        response = requests.get("https://ipinfo.io/json")
+        if response.status_code == 200:
+            data = response.json()
+            return f"{data.get('city')}, {data.get('region')}, {data.get('country')}"
+        else:
+            return "Location Unavailable"
+    except Exception as e:
+        return "Location Error"
 
 class FPS:
     def __init__(self):
