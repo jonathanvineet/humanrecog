@@ -1,5 +1,6 @@
 opencv-python
 numpy
 requests
-# inference 
-# roboflow
+inference
+inference-sdk
+python-dotenv
