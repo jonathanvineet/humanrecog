@@ -1,6 +1,10 @@
+flask
+flask-cors
+werkzeug
 opencv-python
 numpy
 requests
 inference
 inference-sdk
 python-dotenv
+gunicorn
