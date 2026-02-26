@@ -1,6 +1,7 @@
 import os
 import time
 import cv2
+import subprocess
 import base64
 import json
 import random
@@ -21,48 +22,121 @@ INFERENCE_EVERY_N = 12
 
 
 # ═══════════════════════════════════════════════════════════════════
-# CAMERA DETECTION
-# Strategy: video0 only exists when a real USB camera is connected.
-# The permanent encoder/ISP nodes are video10+. So we simply wait
-# for /dev/video0 to appear, then open it by integer index (not path).
+# CAMERA DETECTION via v4l2-ctl
+#
+# v4l2-ctl --list-devices output looks like:
+#
+#   bcm2835-codec-decode (platform:bcm2835-codec):   ← ignore (ISP)
+#           /dev/video10
+#           /dev/video11
+#
+#   USB Camera (usb-xhci-hcd.0-1):                  ← want this
+#           /dev/video0
+#           /dev/video1
+#
+# We grab the first /dev/videoX listed under a "usb" entry.
+# Then open it by passing the file descriptor directly — bypassing
+# OpenCV's broken-on-Pi integer indexing.
 # ═══════════════════════════════════════════════════════════════════
+def get_usb_camera_nodes() -> list[int]:
+    """
+    Runs v4l2-ctl --list-devices and returns the /dev/videoX indices
+    that belong to a USB camera device (not ISP/encoder nodes).
+    """
+    try:
+        out = subprocess.check_output(
+            ["v4l2-ctl", "--list-devices"],
+            stderr=subprocess.DEVNULL,
+            timeout=5
+        ).decode()
+    except Exception as e:
+        print(f"[CAM] v4l2-ctl failed: {e}")
+        return []
+
+    nodes   = []
+    in_usb  = False
+
+    for line in out.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            in_usb = False
+            continue
+
+        # Device header line — check if it's USB
+        if not stripped.startswith("/dev/"):
+            in_usb = "usb" in stripped.lower()
+            continue
+
+        # Device node line
+        if in_usb and stripped.startswith("/dev/video"):
+            try:
+                idx = int(stripped.replace("/dev/video", ""))
+                nodes.append(idx)
+            except ValueError:
+                pass
+
+    return nodes
+
+
 def find_camera(retries: int = 30, delay: float = 3.0) -> cv2.VideoCapture:
-    print("[CAM] Waiting for camera...")
+    """
+    Waits for a USB camera to appear via v4l2-ctl, then opens the
+    correct /dev/videoX node by passing its file descriptor to OpenCV.
+    This bypasses OpenCV's integer re-enumeration which doesn't match
+    /dev/videoN on Pi.
+    """
+    print("[CAM] Waiting for USB camera...")
 
     for attempt in range(retries):
-        # video0 absent = camera not connected/ready yet
-        if not os.path.exists("/dev/video0"):
-            print(f"[CAM] /dev/video0 not found yet (attempt {attempt+1}/{retries}), retrying in {delay}s...")
+        nodes = get_usb_camera_nodes()
+
+        if not nodes:
+            print(f"[CAM] No USB camera found yet (attempt {attempt+1}/{retries}), retrying in {delay}s...")
             time.sleep(delay)
             continue
 
-        print(f"[CAM] /dev/video0 found — opening by index...")
+        print(f"[CAM] USB camera nodes found: {[f'/dev/video{n}' for n in nodes]}")
 
-        # MUST open by integer index on Pi — path string causes V4L2 backend error
-        cap = cv2.VideoCapture(0)
+        for node_idx in nodes:
+            device_path = f"/dev/video{node_idx}"
+            print(f"[CAM] Trying {device_path} via file descriptor...")
 
-        if not cap.isOpened():
-            print(f"[CAM] Failed to open index 0, retrying in {delay}s...")
-            cap.release()
-            time.sleep(delay)
-            continue
+            try:
+                # Open the device file directly and pass the fd to OpenCV.
+                # This is the only 100% reliable method on Pi — it skips
+                # OpenCV's internal V4L2 enumeration entirely.
+                fd  = open(device_path, "rb")
+                cap = cv2.VideoCapture(fd.fileno())
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  480)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
-        cap.set(cv2.CAP_PROP_FPS,          30)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+                if not cap.isOpened():
+                    fd.close()
+                    cap.release()
+                    print(f"[CAM] {device_path} fd open failed — skipping")
+                    continue
 
-        # Read-test to confirm it's actually delivering frames
-        ret, frame = cap.read()
-        if ret and frame is not None:
-            print(f"[CAM] ✅ Camera live on /dev/video0")
-            return cap
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  480)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+                cap.set(cv2.CAP_PROP_FPS,          30)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
 
-        print(f"[CAM] /dev/video0 opened but no frame yet, retrying in {delay}s...")
-        cap.release()
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    print(f"[CAM] ✅ {device_path} is live!")
+                    # Keep fd open for the lifetime of cap
+                    cap._fd = fd
+                    return cap
+
+                fd.close()
+                cap.release()
+                print(f"[CAM] {device_path} opened but no frame — skipping")
+
+            except Exception as e:
+                print(f"[CAM] {device_path} error: {e} — skipping")
+
+        print(f"[CAM] No working node yet. Retrying in {delay}s...")
         time.sleep(delay)
 
-    raise RuntimeError("[CAM] ❌ Camera never became ready.")
+    raise RuntimeError("[CAM] ❌ No working USB camera found after all retries.")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -144,7 +218,6 @@ def main():
     inf_proc.start()
     print("[SUCCESS] Inference process spawned (GIL-free)")
 
-    # Wait for /dev/video0 to appear, then open by index
     cap     = find_camera(retries=30, delay=3.0)
     capture = CaptureThread(cap)
     capture.start()
