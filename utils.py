@@ -8,7 +8,7 @@ def get_current_location():
             data = response.json()
             loc = data.get('loc', '12.9716,77.5946').split(',')
             lat, lng = float(loc[0]), float(loc[1])
-            return round(lat, 7), round(lng, 7)
+            return round(lat, 10), round(lng, 10)
         else:
             return 12.9716, 77.5946 # Fallback
     except Exception as e:
