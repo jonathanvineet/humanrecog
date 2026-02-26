@@ -6,10 +6,11 @@ import requests
 import json
 import random
 from datetime import datetime
-from threading import Thread
+from threading import Thread, Lock
 from queue import Queue, Empty
 from dotenv import load_dotenv
 from inference import get_model
+from utils import get_current_location
 
 # =============================
 # Configuration
@@ -28,8 +29,8 @@ HOME_LNG = 77.5946
 JPEG_QUALITY = 35        # Lower = Faster
 FRAME_WIDTH = 480        # Reduced for 30fps throughput
 FRAME_HEIGHT = 360
-UPLOAD_WORKERS = 4       # Multiple threads to beat network latency
-INFERENCE_EVERY_N = 3    # Run AI on 1 out of every 3 frames to maintain 30FPS stream
+UPLOAD_WORKERS = 2       # Reduced to minimize out-of-order frames
+INFERENCE_EVERY_N = 2    # Faster inference frequency
 
 # Queues
 raw_frame_queue = Queue(maxsize=1)   # Always hold the newest frame
@@ -39,41 +40,34 @@ processed_queue = Queue(maxsize=15)  # Outgoing stream queue
 current_lat = HOME_LAT
 current_lng = HOME_LNG
 latest_detections = [] 
-
-# AUTOMATED IP-BASED LOCATION
-def get_ip_location():
-    """Gets approximate location via IP Geolocation - No hardware required."""
-    try:
-        print("[INFO] Fetching automated location from network...")
-        response = requests.get('https://ipapi.co/json/', timeout=5)
-        data = response.json()
-        if 'latitude' in data and 'longitude' in data:
-            print(f"[SUCCESS] Location locked to: {data.get('city')}, {data.get('region')}")
-            return float(data['latitude']), float(data['longitude'])
-    except Exception as e:
-        print(f"[WARNING] Location fetch failed: {e}")
-    return HOME_LAT, HOME_LNG
+detections_lock = Lock()
 
 # Initial location lock
-current_lat, current_lng = get_ip_location()
+try:
+    current_lat, current_lng = get_current_location()
+except:
+    current_lat, current_lng = HOME_LAT, HOME_LNG
+
 location_count = 0
 
 def get_location():
-    """ 
-    Python-native location engine.
-    Uses IP discovery first, then simulates micro-movement.
-    """
     global current_lat, current_lng, location_count
     
+    # Periodically refresh base location (less frequent to avoid blocking)
+    if location_count % 300 == 0:
+        try:
+            current_lat, current_lng = get_current_location()
+        except: pass
+
     # Simulating movement drift
     current_lat += random.uniform(-0.0001, 0.0001)
     current_lng += random.uniform(-0.0001, 0.0001)
     
     location_count += 1
     if location_count % 30 == 0:
-        print(f"📍 Current Precision Lock: {current_lat:.10f}, {current_lng:.10f}")
+        print(f"📍 Precision Lock [7-dec]: {current_lat:.7f}, {current_lng:.7f}")
         
-    return round(current_lat, 10), round(current_lng, 10)
+    return round(current_lat, 7), round(current_lng, 7)
 
 def save_detection_locally(frame, count, lat, lng):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -127,7 +121,8 @@ def inference_engine():
                             "box": [int(p.x - p.width/2), int(p.y - p.height/2), int(p.x + p.width/2), int(p.y + p.height/2)],
                             "conf": p.confidence
                         })
-            latest_detections = temp_preds
+            with detections_lock:
+                latest_detections = temp_preds
         except Empty: continue
         except Exception: pass
 
@@ -141,8 +136,9 @@ def stream_processor():
             lat, lng = get_location()
             
             # Draw latest known detections (Zero latency overlay)
-            for det in latest_detections:
-                cv2.rectangle(frame, (det["box"][0], det["box"][1]), (det["box"][2], det["box"][3]), (0, 255, 0), 2)
+            with detections_lock:
+                for det in latest_detections:
+                    cv2.rectangle(frame, (det["box"][0], det["box"][1]), (det["box"][2], det["box"][3]), (0, 255, 0), 2)
             
             # Local Logging (Optional)
             if latest_detections and frame_count % 30 == 0:
@@ -159,7 +155,8 @@ def stream_processor():
                     "lat": lat, "lng": lng
                 })
             frame_count += 1
-            time.sleep(0.01) # Target ~30-60 cycle
+            # Minimum sleep to allow thread switching but keep 30FPS+
+            time.sleep(0.001) 
         except Empty: continue
 
 def upload_worker(id):

@@ -6,11 +6,13 @@ def get_current_location():
         response = requests.get("https://ipinfo.io/json")
         if response.status_code == 200:
             data = response.json()
-            return f"{data.get('city')}, {data.get('region')}, {data.get('country')}"
+            loc = data.get('loc', '12.9716,77.5946').split(',')
+            lat, lng = float(loc[0]), float(loc[1])
+            return round(lat, 7), round(lng, 7)
         else:
-            return "Location Unavailable"
+            return 12.9716, 77.5946 # Fallback
     except Exception as e:
-        return "Location Error"
+        return 12.9716, 77.5946 # Fallback
 
 class FPS:
     def __init__(self):
