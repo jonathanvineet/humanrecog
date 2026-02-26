@@ -11,6 +11,7 @@ import base64
 import requests
 import json
 from datetime import datetime
+import random
 from threading import Thread
 from dotenv import load_dotenv
 from inference import get_model
@@ -25,7 +26,7 @@ VERCEL_APP_URL = os.getenv("VERCEL_APP_URL", "http://localhost:3000")
 
 # Local Storage Configuration
 SAVE_DIRECTORY = "detections"
-SAVE_DELAY = 50  # Seconds between local saves to prevent waste of space
+SAVE_DELAY = 2  # Seconds between local saves to prevent waste of space
 if not os.path.exists(SAVE_DIRECTORY):
     os.makedirs(SAVE_DIRECTORY)
 
@@ -37,15 +38,19 @@ last_save_time = 0
 # =============================
 # Location Helper
 # =============================
+# Mock variables for coordinate drift
+current_lat = 12.971598765432
+current_lng = 77.594567890123
+
 def get_location():
     """
-    Mock function for high-precision location data. 
-    In production, replace this with actual GPS module reading logic.
+    Mock function for high-precision location data with movement.
     """
-    # Precision coordinates for "Down to the dot" accuracy
-    lat = 12.971598765432
-    lng = 77.594567890123
-    return round(lat, 10), round(lng, 10)
+    global current_lat, current_lng
+    # Small random walk to simulate movement (approx 1-2 meters)
+    current_lat += random.uniform(-0.00001, 0.00001)
+    current_lng += random.uniform(-0.00001, 0.00001)
+    return round(current_lat, 10), round(current_lng, 10)
 
 # =============================
 # Camera capture thread
@@ -69,7 +74,7 @@ class CameraStream:
             ret, frame = self.cap.read()
             if ret:
                 self.frame = frame
-            time.sleep(0.01)
+            # No sleep here for maximum possible throughput
 
     def read(self):
         return self.frame
@@ -158,8 +163,8 @@ def main():
             
             frame_count += 1
             
-            # Run inference every 3 frames for better speed vs current 5
-            if frame_count % 3 == 0:
+            # Run inference every 2 frames for a "smoother" faster-updating feed
+            if frame_count % 2 == 0:
                 try:
                     display_frame = frame.copy()
                     lat, lng = get_location()
@@ -184,8 +189,8 @@ def main():
                     if detections_count > 0:
                         save_detection_locally(display_frame, detections_count, lat, lng)
                     
-                    # Encode frame to base64 (using lower quality for speed)
-                    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+                    # Encode frame to base64 (using lower quality for maximum speed)
+                    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 45]
                     ret, buffer = cv2.imencode('.jpg', display_frame, encode_param)
                     frame_base64 = base64.b64encode(buffer).decode('utf-8')
                     
@@ -199,8 +204,8 @@ def main():
                 except Exception as e:
                     print(f"[ERROR] Loop error: {e}")
             
-            # Small sleep to yield
-            time.sleep(0.01)
+            # Tiny sleep to yield without blocking throughput
+            time.sleep(0.001)
             
     except KeyboardInterrupt:
         print("\n[INFO] Stopping...")
