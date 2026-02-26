@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 from utils import get_current_location
 import paho.mqtt.client as mqtt
 
-# ── Disable obsensor BEFORE importing cv2 does anything ──────────────────────
 os.environ["OPENCV_VIDEOIO_PRIORITY_OBSENSOR"] = "0"
 os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"]     = "0"
 
@@ -24,7 +23,11 @@ MQTT_BROKER       = "broker.emqx.io"
 MQTT_PORT         = 1883
 MQTT_TOPIC        = "humanrecog/video/jonathan_feed"
 INFERENCE_EVERY_N = 12
-WIDTH, HEIGHT     = 480, 360
+
+# Camera confirmed: supports MJPEG 640x360 @ 30fps
+# MJPEG = compressed on-chip = much less USB bandwidth than YUYV
+WIDTH, HEIGHT = 640, 360
+CAM_FORMAT    = "mjpeg"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -54,18 +57,27 @@ def get_usb_camera_path() -> str | None:
     return None
 
 
+def wait_for_camera(retries: int = 30, delay: float = 3.0) -> str:
+    print("[CAM] Waiting for USB camera...")
+    for attempt in range(retries):
+        path = get_usb_camera_path()
+        if path:
+            print(f"[CAM] Found: {path}")
+            return path
+        print(f"[CAM] Not found yet ({attempt+1}/{retries}), retrying in {delay}s...")
+        time.sleep(delay)
+    raise RuntimeError("[CAM] No USB camera found.")
+
+
 # ═══════════════════════════════════════════════════════════════════
 # FFMPEG CAPTURE THREAD
-# Completely bypasses OpenCV's broken plugin system.
-# ffmpeg talks directly to V4L2, pipes raw BGR frames to us.
+# Uses MJPEG input (compressed on-chip) → decoded to raw BGR by ffmpeg
+# Completely bypasses OpenCV's broken obsensor plugin
 # ═══════════════════════════════════════════════════════════════════
 class FFmpegCaptureThread(threading.Thread):
-    def __init__(self, device: str, width: int, height: int, fps: int = 30):
+    def __init__(self, device: str):
         super().__init__(daemon=True)
         self.device  = device
-        self.width   = width
-        self.height  = height
-        self.fps     = fps
         self.frame   = None
         self.lock    = threading.Lock()
         self.running = True
@@ -74,21 +86,21 @@ class FFmpegCaptureThread(threading.Thread):
     def _build_cmd(self):
         return [
             "ffmpeg",
-            "-loglevel", "error",          # suppress noise
-            "-f", "v4l2",                  # force V4L2 — no plugin roulette
-            "-input_format", "mjpeg",      # USB cams speak MJPEG natively (fast)
-            "-video_size", f"{self.width}x{self.height}",
-            "-framerate", str(self.fps),
-            "-i", self.device,
-            "-f", "rawvideo",
-            "-pix_fmt", "bgr24",           # OpenCV-native pixel format
-            "pipe:1",                      # stream to stdout
+            "-loglevel",      "error",
+            "-f",             "v4l2",
+            "-input_format",  CAM_FORMAT,        # mjpeg — native camera compression
+            "-video_size",    f"{WIDTH}x{HEIGHT}",
+            "-framerate",     "30",
+            "-i",             self.device,
+            "-f",             "rawvideo",
+            "-pix_fmt",       "bgr24",            # OpenCV-native
+            "pipe:1",
         ]
 
     def run(self):
-        frame_bytes = self.width * self.height * 3
-        cmd = self._build_cmd()
-        print(f"[CAM] ffmpeg capturing from {self.device}")
+        frame_bytes = WIDTH * HEIGHT * 3
+        cmd         = self._build_cmd()
+        print(f"[CAM] Starting ffmpeg: {' '.join(cmd)}")
 
         while self.running:
             try:
@@ -96,29 +108,29 @@ class FFmpegCaptureThread(threading.Thread):
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    bufsize=frame_bytes * 2
+                    bufsize=frame_bytes * 4
                 )
 
                 while self.running:
                     raw = self.process.stdout.read(frame_bytes)
                     if len(raw) != frame_bytes:
-                        print("[CAM] ffmpeg pipe ended — restarting...")
+                        err = self.process.stderr.read(500).decode(errors="replace")
+                        print(f"[CAM] Pipe ended. stderr: {err.strip()}")
                         break
 
-                    frame = np.frombuffer(raw, dtype=np.uint8).reshape(
-                        (self.height, self.width, 3)
-                    )
+                    frame = np.frombuffer(raw, dtype=np.uint8).reshape((HEIGHT, WIDTH, 3))
                     with self.lock:
                         self.frame = frame
 
             except Exception as e:
-                print(f"[CAM] ffmpeg error: {e}")
+                print(f"[CAM] Exception: {e}")
 
             if self.process:
                 self.process.kill()
                 self.process = None
 
             if self.running:
+                print("[CAM] Restarting ffmpeg in 2s...")
                 time.sleep(2)
 
     def read(self):
@@ -129,18 +141,6 @@ class FFmpegCaptureThread(threading.Thread):
         self.running = False
         if self.process:
             self.process.kill()
-
-
-def wait_for_camera(retries: int = 30, delay: float = 3.0) -> str:
-    print("[CAM] Waiting for USB camera...")
-    for attempt in range(retries):
-        path = get_usb_camera_path()
-        if path:
-            print(f"[CAM] Found: {path}")
-            return path
-        print(f"[CAM] Not found yet (attempt {attempt+1}/{retries}), retrying in {delay}s...")
-        time.sleep(delay)
-    raise RuntimeError("[CAM] ❌ No USB camera found.")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -175,6 +175,32 @@ def inference_process_fn(frame_q: mp.Queue, result_q: mp.Queue, model_id: str, a
 
 
 # ═══════════════════════════════════════════════════════════════════
+# CAPTURE THREAD
+# ═══════════════════════════════════════════════════════════════════
+class CaptureThread(threading.Thread):
+    def __init__(self, cap: cv2.VideoCapture):
+        super().__init__(daemon=True)
+        self.cap     = cap
+        self.frame   = None
+        self.lock    = threading.Lock()
+        self.running = True
+
+    def run(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret:
+                with self.lock:
+                    self.frame = frame
+
+    def read(self):
+        with self.lock:
+            return self.frame.copy() if self.frame is not None else None
+
+    def stop(self):
+        self.running = False
+
+
+# ═══════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════
 def main():
@@ -192,10 +218,9 @@ def main():
     print("[SUCCESS] Inference process spawned (GIL-free)")
 
     device  = wait_for_camera(retries=30, delay=3.0)
-    capture = FFmpegCaptureThread(device, WIDTH, HEIGHT, fps=30)
+    capture = FFmpegCaptureThread(device)
     capture.start()
 
-    # Wait until first frame arrives
     print("[CAM] Waiting for first frame...")
     for _ in range(60):
         if capture.read() is not None:
