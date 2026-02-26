@@ -2,6 +2,7 @@ import os
 import time
 import cv2
 import subprocess
+import numpy as np
 import base64
 import json
 import random
@@ -11,6 +12,10 @@ from dotenv import load_dotenv
 from utils import get_current_location
 import paho.mqtt.client as mqtt
 
+# ── Disable obsensor BEFORE importing cv2 does anything ──────────────────────
+os.environ["OPENCV_VIDEOIO_PRIORITY_OBSENSOR"] = "0"
+os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"]     = "0"
+
 load_dotenv()
 MODEL_ID = os.getenv("MODEL_ID")
 API_KEY  = os.getenv("ROBOFLOW_API_KEY")
@@ -19,124 +24,123 @@ MQTT_BROKER       = "broker.emqx.io"
 MQTT_PORT         = 1883
 MQTT_TOPIC        = "humanrecog/video/jonathan_feed"
 INFERENCE_EVERY_N = 12
+WIDTH, HEIGHT     = 480, 360
 
 
 # ═══════════════════════════════════════════════════════════════════
-# CAMERA DETECTION via v4l2-ctl
-#
-# v4l2-ctl --list-devices output looks like:
-#
-#   bcm2835-codec-decode (platform:bcm2835-codec):   ← ignore (ISP)
-#           /dev/video10
-#           /dev/video11
-#
-#   USB Camera (usb-xhci-hcd.0-1):                  ← want this
-#           /dev/video0
-#           /dev/video1
-#
-# We grab the first /dev/videoX listed under a "usb" entry.
-# Then open it by passing the file descriptor directly — bypassing
-# OpenCV's broken-on-Pi integer indexing.
+# CAMERA DETECTION
 # ═══════════════════════════════════════════════════════════════════
-def get_usb_camera_nodes() -> list[int]:
-    """
-    Runs v4l2-ctl --list-devices and returns the /dev/videoX indices
-    that belong to a USB camera device (not ISP/encoder nodes).
-    """
+def get_usb_camera_path() -> str | None:
     try:
         out = subprocess.check_output(
             ["v4l2-ctl", "--list-devices"],
-            stderr=subprocess.DEVNULL,
-            timeout=5
+            stderr=subprocess.DEVNULL, timeout=5
         ).decode()
     except Exception as e:
         print(f"[CAM] v4l2-ctl failed: {e}")
-        return []
+        return None
 
-    nodes   = []
-    in_usb  = False
-
+    in_usb = False
     for line in out.splitlines():
         stripped = line.strip()
         if not stripped:
             in_usb = False
             continue
-
-        # Device header line — check if it's USB
         if not stripped.startswith("/dev/"):
             in_usb = "usb" in stripped.lower()
             continue
-
-        # Device node line
         if in_usb and stripped.startswith("/dev/video"):
+            return stripped
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FFMPEG CAPTURE THREAD
+# Completely bypasses OpenCV's broken plugin system.
+# ffmpeg talks directly to V4L2, pipes raw BGR frames to us.
+# ═══════════════════════════════════════════════════════════════════
+class FFmpegCaptureThread(threading.Thread):
+    def __init__(self, device: str, width: int, height: int, fps: int = 30):
+        super().__init__(daemon=True)
+        self.device  = device
+        self.width   = width
+        self.height  = height
+        self.fps     = fps
+        self.frame   = None
+        self.lock    = threading.Lock()
+        self.running = True
+        self.process = None
+
+    def _build_cmd(self):
+        return [
+            "ffmpeg",
+            "-loglevel", "error",          # suppress noise
+            "-f", "v4l2",                  # force V4L2 — no plugin roulette
+            "-input_format", "mjpeg",      # USB cams speak MJPEG natively (fast)
+            "-video_size", f"{self.width}x{self.height}",
+            "-framerate", str(self.fps),
+            "-i", self.device,
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",           # OpenCV-native pixel format
+            "pipe:1",                      # stream to stdout
+        ]
+
+    def run(self):
+        frame_bytes = self.width * self.height * 3
+        cmd = self._build_cmd()
+        print(f"[CAM] ffmpeg capturing from {self.device}")
+
+        while self.running:
             try:
-                idx = int(stripped.replace("/dev/video", ""))
-                nodes.append(idx)
-            except ValueError:
-                pass
+                self.process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=frame_bytes * 2
+                )
 
-    return nodes
+                while self.running:
+                    raw = self.process.stdout.read(frame_bytes)
+                    if len(raw) != frame_bytes:
+                        print("[CAM] ffmpeg pipe ended — restarting...")
+                        break
 
-
-def find_camera(retries: int = 30, delay: float = 3.0) -> cv2.VideoCapture:
-    """
-    Waits for a USB camera to appear via v4l2-ctl, then opens the
-    correct /dev/videoX node by passing its file descriptor to OpenCV.
-    This bypasses OpenCV's integer re-enumeration which doesn't match
-    /dev/videoN on Pi.
-    """
-    print("[CAM] Waiting for USB camera...")
-
-    for attempt in range(retries):
-        nodes = get_usb_camera_nodes()
-
-        if not nodes:
-            print(f"[CAM] No USB camera found yet (attempt {attempt+1}/{retries}), retrying in {delay}s...")
-            time.sleep(delay)
-            continue
-
-        print(f"[CAM] USB camera nodes found: {[f'/dev/video{n}' for n in nodes]}")
-
-        for node_idx in nodes:
-            device_path = f"/dev/video{node_idx}"
-            print(f"[CAM] Trying {device_path} via file descriptor...")
-
-            try:
-                # Open the device file directly and pass the fd to OpenCV.
-                # This is the only 100% reliable method on Pi — it skips
-                # OpenCV's internal V4L2 enumeration entirely.
-                fd  = open(device_path, "rb")
-                cap = cv2.VideoCapture(fd.fileno())
-
-                if not cap.isOpened():
-                    fd.close()
-                    cap.release()
-                    print(f"[CAM] {device_path} fd open failed — skipping")
-                    continue
-
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  480)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
-                cap.set(cv2.CAP_PROP_FPS,          30)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
-
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    print(f"[CAM] ✅ {device_path} is live!")
-                    # Keep fd open for the lifetime of cap
-                    cap._fd = fd
-                    return cap
-
-                fd.close()
-                cap.release()
-                print(f"[CAM] {device_path} opened but no frame — skipping")
+                    frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+                        (self.height, self.width, 3)
+                    )
+                    with self.lock:
+                        self.frame = frame
 
             except Exception as e:
-                print(f"[CAM] {device_path} error: {e} — skipping")
+                print(f"[CAM] ffmpeg error: {e}")
 
-        print(f"[CAM] No working node yet. Retrying in {delay}s...")
+            if self.process:
+                self.process.kill()
+                self.process = None
+
+            if self.running:
+                time.sleep(2)
+
+    def read(self):
+        with self.lock:
+            return self.frame.copy() if self.frame is not None else None
+
+    def stop(self):
+        self.running = False
+        if self.process:
+            self.process.kill()
+
+
+def wait_for_camera(retries: int = 30, delay: float = 3.0) -> str:
+    print("[CAM] Waiting for USB camera...")
+    for attempt in range(retries):
+        path = get_usb_camera_path()
+        if path:
+            print(f"[CAM] Found: {path}")
+            return path
+        print(f"[CAM] Not found yet (attempt {attempt+1}/{retries}), retrying in {delay}s...")
         time.sleep(delay)
-
-    raise RuntimeError("[CAM] ❌ No working USB camera found after all retries.")
+    raise RuntimeError("[CAM] ❌ No USB camera found.")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -152,53 +156,22 @@ def inference_process_fn(frame_q: mp.Queue, result_q: mp.Queue, model_id: str, a
             frame = frame_q.get(timeout=2)
         except Exception:
             continue
-
         try:
             results    = model.infer(frame)[0]
             boxes      = []
             detections = 0
-
             if hasattr(results, "predictions"):
                 for p in results.predictions:
                     if p.class_name.lower() in ["person", "human"]:
                         detections += 1
                         x, y, w, h = int(p.x), int(p.y), int(p.width), int(p.height)
-                        boxes.append((int(x - w/2), int(y - h/2), int(x + w/2), int(y + h/2)))
-
+                        boxes.append((int(x-w/2), int(y-h/2), int(x+w/2), int(y+h/2)))
             while not result_q.empty():
                 try: result_q.get_nowait()
                 except: pass
-
             result_q.put({"boxes": boxes, "detections": detections})
-
         except Exception as e:
             print(f"[INFERENCE PROC] Error: {e}")
-
-
-# ═══════════════════════════════════════════════════════════════════
-# CAPTURE THREAD
-# ═══════════════════════════════════════════════════════════════════
-class CaptureThread(threading.Thread):
-    def __init__(self, cap: cv2.VideoCapture):
-        super().__init__(daemon=True)
-        self.cap     = cap
-        self.frame   = None
-        self.lock    = threading.Lock()
-        self.running = True
-
-    def run(self):
-        while self.running:
-            ret, frame = self.cap.read()
-            if ret:
-                with self.lock:
-                    self.frame = frame
-
-    def read(self):
-        with self.lock:
-            return self.frame.copy() if self.frame is not None else None
-
-    def stop(self):
-        self.running = False
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -218,10 +191,17 @@ def main():
     inf_proc.start()
     print("[SUCCESS] Inference process spawned (GIL-free)")
 
-    cap     = find_camera(retries=30, delay=3.0)
-    capture = CaptureThread(cap)
+    device  = wait_for_camera(retries=30, delay=3.0)
+    capture = FFmpegCaptureThread(device, WIDTH, HEIGHT, fps=30)
     capture.start()
-    print("[SUCCESS] Capture thread running")
+
+    # Wait until first frame arrives
+    print("[CAM] Waiting for first frame...")
+    for _ in range(60):
+        if capture.read() is not None:
+            break
+        time.sleep(0.5)
+    print("[SUCCESS] Camera stream live")
 
     client = mqtt.Client()
     client.connect(MQTT_BROKER, MQTT_PORT, 60)
@@ -259,10 +239,8 @@ def main():
 
         if frame_count % INFERENCE_EVERY_N == 0:
             if not frame_q.full():
-                try:
-                    frame_q.put_nowait(frame.copy())
-                except:
-                    pass
+                try: frame_q.put_nowait(frame.copy())
+                except: pass
 
         for (x1, y1, x2, y2) in cached_boxes:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -291,7 +269,7 @@ def main():
         fps_count += 1
         elapsed = time.time() - fps_timer
         if elapsed >= 3.0:
-            print(f"📡 {fps_count / elapsed:.1f} fps  |  {cached_detections} detections  |  {lat:.6f}, {lng:.6f}")
+            print(f"📡 {fps_count/elapsed:.1f} fps  |  {cached_detections} det  |  {lat:.6f}, {lng:.6f}")
             fps_count = 0
             fps_timer = time.time()
 
