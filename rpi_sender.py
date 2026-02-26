@@ -23,50 +23,89 @@ INFERENCE_EVERY_N = 12
 
 # ═══════════════════════════════════════════════════════════════════
 # CAMERA DETECTION
-# Scans all /dev/video* devices, tests each one for a real frame,
-# and returns the first working capture object.
+# Uses Linux sysfs to pre-filter ONLY real capture-capable devices.
+# Skips encoder nodes (video10, video11...) without even opening them.
 # ═══════════════════════════════════════════════════════════════════
-def find_camera(retries: int = 10, delay: float = 3.0) -> cv2.VideoCapture:
+def get_real_capture_devices() -> list[str]:
     """
-    Scans /dev/video0 through /dev/video9, picks the first device
-    that successfully delivers a frame. Retries every `delay` seconds
-    up to `retries` times (covers slow USB init on boot).
+    Reads /sys/class/video4linux/videoX/device/capabilities (or uevent)
+    to find only devices with capture capability (0x00000001 bit set).
+    Falls back to all /dev/video* if sysfs isn't available.
+    """
+    real_devices = []
+
+    for path in sorted(glob.glob("/dev/video*")):
+        name = os.path.basename(path)  # e.g. "video0"
+
+        # Check sysfs capabilities — bit 0x00000001 = V4L2_CAP_VIDEO_CAPTURE
+        caps_file = f"/sys/class/video4linux/{name}/device/capabilities"
+        uevent_file = f"/sys/class/video4linux/{name}/uevent"
+
+        is_capture = False
+
+        if os.path.exists(caps_file):
+            try:
+                caps = int(open(caps_file).read().strip(), 16)
+                if caps & 0x00000001:  # VIDEO_CAPTURE bit
+                    is_capture = True
+            except:
+                pass
+
+        # Fallback: check uevent for "video4linux" type
+        if not is_capture and os.path.exists(uevent_file):
+            try:
+                content = open(uevent_file).read()
+                # If no caps file, just include video0-9 (low-index = real cam)
+                idx = int(name.replace("video", ""))
+                if idx < 10:
+                    is_capture = True
+            except:
+                pass
+
+        if is_capture:
+            real_devices.append(path)
+
+    return real_devices
+
+
+def find_camera(retries: int = 15, delay: float = 3.0) -> cv2.VideoCapture:
+    """
+    Scans only real capture devices (sysfs-filtered), tests each for a
+    live frame. Retries every `delay` seconds to handle slow USB init.
     """
     for attempt in range(retries):
-        devices = sorted(glob.glob("/dev/video*"))
-        print(f"[CAM] Attempt {attempt + 1}/{retries} — found devices: {devices or 'none'}")
+        devices = get_real_capture_devices()
+        print(f"[CAM] Attempt {attempt + 1}/{retries} — capture devices: {devices or 'none'}")
 
-        for device in devices:
-            # Extract index (e.g. /dev/video2 → 2)
-            try:
-                idx = int(device.replace("/dev/video", ""))
-            except ValueError:
-                continue
+        for device_path in devices:
+            print(f"[CAM] Trying {device_path}...")
 
-            cap = cv2.VideoCapture(idx)
+            # Open by full path (more reliable than index on Pi)
+            cap = cv2.VideoCapture(device_path, cv2.CAP_V4L2)
+
             if not cap.isOpened():
+                print(f"[CAM] {device_path} failed to open — skipping")
                 cap.release()
                 continue
 
-            # A device can "open" but still not deliver frames (metadata-only
-            # video devices like /dev/video10 on Pi are common). Read-test it.
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  480)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
             cap.set(cv2.CAP_PROP_FPS,          30)
             cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
 
+            # Read-test: a device can open but still not deliver frames
             ret, frame = cap.read()
             if ret and frame is not None:
-                print(f"[CAM] ✅ Using {device} (index {idx})")
+                print(f"[CAM] ✅ {device_path} is live!")
                 return cap
 
-            print(f"[CAM] {device} opened but gave no frame — skipping")
+            print(f"[CAM] {device_path} opened but gave no frame — skipping")
             cap.release()
 
-        print(f"[CAM] No working camera found. Retrying in {delay}s...")
+        print(f"[CAM] No working camera yet. Retrying in {delay}s...")
         time.sleep(delay)
 
-    raise RuntimeError("[CAM] ❌ Could not find any working camera after all retries.")
+    raise RuntimeError("[CAM] ❌ No working camera found after all retries.")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -95,7 +134,6 @@ def inference_process_fn(frame_q: mp.Queue, result_q: mp.Queue, model_id: str, a
                         x, y, w, h = int(p.x), int(p.y), int(p.width), int(p.height)
                         boxes.append((int(x - w/2), int(y - h/2), int(x + w/2), int(y + h/2)))
 
-            # Drain stale results before writing new one
             while not result_q.empty():
                 try: result_q.get_nowait()
                 except: pass
@@ -107,8 +145,7 @@ def inference_process_fn(frame_q: mp.Queue, result_q: mp.Queue, model_id: str, a
 
 
 # ═══════════════════════════════════════════════════════════════════
-# CAPTURE THREAD  (continuously drains camera buffer)
-# Keeps the buffer empty so main loop always gets the freshest frame.
+# CAPTURE THREAD
 # ═══════════════════════════════════════════════════════════════════
 class CaptureThread(threading.Thread):
     def __init__(self, cap: cv2.VideoCapture):
@@ -139,7 +176,6 @@ class CaptureThread(threading.Thread):
 def main():
     print("[INFO] Starting GIL-free high-speed stream...")
 
-    # ── Inference process ─────────────────────────────────────────────────────
     frame_q  = mp.Queue(maxsize=1)
     result_q = mp.Queue(maxsize=1)
 
@@ -151,19 +187,16 @@ def main():
     inf_proc.start()
     print("[SUCCESS] Inference process spawned (GIL-free)")
 
-    # ── Camera — auto-detect, retry until ready ───────────────────────────────
-    cap     = find_camera(retries=10, delay=3.0)
+    cap     = find_camera(retries=15, delay=3.0)
     capture = CaptureThread(cap)
     capture.start()
     print("[SUCCESS] Capture thread running")
 
-    # ── MQTT ──────────────────────────────────────────────────────────────────
     client = mqtt.Client()
     client.connect(MQTT_BROKER, MQTT_PORT, 60)
     client.loop_start()
     print(f"[SUCCESS] MQTT tunnel open → {MQTT_BROKER}")
 
-    # ── GPS ───────────────────────────────────────────────────────────────────
     try:
         base_lat, base_lng = get_current_location()
         print(f"📍 Base coordinate: {base_lat:.10f}, {base_lng:.10f}")
@@ -177,7 +210,6 @@ def main():
     fps_count         = 0
     fps_timer         = time.time()
 
-    # ── Stream loop ───────────────────────────────────────────────────────────
     while True:
         frame = capture.read()
         if frame is None:
@@ -186,7 +218,6 @@ def main():
 
         frame_count += 1
 
-        # Non-blocking poll for fresh inference results
         if not result_q.empty():
             try:
                 res               = result_q.get_nowait()
@@ -195,7 +226,6 @@ def main():
             except:
                 pass
 
-        # Submit frame to inference process (dropped if still busy — never blocks)
         if frame_count % INFERENCE_EVERY_N == 0:
             if not frame_q.full():
                 try:
@@ -203,7 +233,6 @@ def main():
                 except:
                     pass
 
-        # Draw cached bounding boxes (zero inference cost)
         for (x1, y1, x2, y2) in cached_boxes:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(frame, "HUMAN", (x1, y1 - 8),
