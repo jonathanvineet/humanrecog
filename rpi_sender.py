@@ -1,7 +1,6 @@
 import os
 import time
 import cv2
-import glob
 import base64
 import json
 import random
@@ -23,89 +22,47 @@ INFERENCE_EVERY_N = 12
 
 # ═══════════════════════════════════════════════════════════════════
 # CAMERA DETECTION
-# Uses Linux sysfs to pre-filter ONLY real capture-capable devices.
-# Skips encoder nodes (video10, video11...) without even opening them.
+# Strategy: video0 only exists when a real USB camera is connected.
+# The permanent encoder/ISP nodes are video10+. So we simply wait
+# for /dev/video0 to appear, then open it by integer index (not path).
 # ═══════════════════════════════════════════════════════════════════
-def get_real_capture_devices() -> list[str]:
-    """
-    Reads /sys/class/video4linux/videoX/device/capabilities (or uevent)
-    to find only devices with capture capability (0x00000001 bit set).
-    Falls back to all /dev/video* if sysfs isn't available.
-    """
-    real_devices = []
+def find_camera(retries: int = 30, delay: float = 3.0) -> cv2.VideoCapture:
+    print("[CAM] Waiting for camera...")
 
-    for path in sorted(glob.glob("/dev/video*")):
-        name = os.path.basename(path)  # e.g. "video0"
-
-        # Check sysfs capabilities — bit 0x00000001 = V4L2_CAP_VIDEO_CAPTURE
-        caps_file = f"/sys/class/video4linux/{name}/device/capabilities"
-        uevent_file = f"/sys/class/video4linux/{name}/uevent"
-
-        is_capture = False
-
-        if os.path.exists(caps_file):
-            try:
-                caps = int(open(caps_file).read().strip(), 16)
-                if caps & 0x00000001:  # VIDEO_CAPTURE bit
-                    is_capture = True
-            except:
-                pass
-
-        # Fallback: check uevent for "video4linux" type
-        if not is_capture and os.path.exists(uevent_file):
-            try:
-                content = open(uevent_file).read()
-                # If no caps file, just include video0-9 (low-index = real cam)
-                idx = int(name.replace("video", ""))
-                if idx < 10:
-                    is_capture = True
-            except:
-                pass
-
-        if is_capture:
-            real_devices.append(path)
-
-    return real_devices
-
-
-def find_camera(retries: int = 15, delay: float = 3.0) -> cv2.VideoCapture:
-    """
-    Scans only real capture devices (sysfs-filtered), tests each for a
-    live frame. Retries every `delay` seconds to handle slow USB init.
-    """
     for attempt in range(retries):
-        devices = get_real_capture_devices()
-        print(f"[CAM] Attempt {attempt + 1}/{retries} — capture devices: {devices or 'none'}")
+        # video0 absent = camera not connected/ready yet
+        if not os.path.exists("/dev/video0"):
+            print(f"[CAM] /dev/video0 not found yet (attempt {attempt+1}/{retries}), retrying in {delay}s...")
+            time.sleep(delay)
+            continue
 
-        for device_path in devices:
-            print(f"[CAM] Trying {device_path}...")
+        print(f"[CAM] /dev/video0 found — opening by index...")
 
-            # Open by full path (more reliable than index on Pi)
-            cap = cv2.VideoCapture(device_path, cv2.CAP_V4L2)
+        # MUST open by integer index on Pi — path string causes V4L2 backend error
+        cap = cv2.VideoCapture(0)
 
-            if not cap.isOpened():
-                print(f"[CAM] {device_path} failed to open — skipping")
-                cap.release()
-                continue
-
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  480)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
-            cap.set(cv2.CAP_PROP_FPS,          30)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
-
-            # Read-test: a device can open but still not deliver frames
-            ret, frame = cap.read()
-            if ret and frame is not None:
-                print(f"[CAM] ✅ {device_path} is live!")
-                return cap
-
-            print(f"[CAM] {device_path} opened but gave no frame — skipping")
+        if not cap.isOpened():
+            print(f"[CAM] Failed to open index 0, retrying in {delay}s...")
             cap.release()
+            time.sleep(delay)
+            continue
 
-        print(f"[CAM] No working camera yet. Retrying in {delay}s...")
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  480)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+        cap.set(cv2.CAP_PROP_FPS,          30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+
+        # Read-test to confirm it's actually delivering frames
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            print(f"[CAM] ✅ Camera live on /dev/video0")
+            return cap
+
+        print(f"[CAM] /dev/video0 opened but no frame yet, retrying in {delay}s...")
+        cap.release()
         time.sleep(delay)
 
-    raise RuntimeError("[CAM] ❌ No working camera found after all retries.")
+    raise RuntimeError("[CAM] ❌ Camera never became ready.")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -187,7 +144,8 @@ def main():
     inf_proc.start()
     print("[SUCCESS] Inference process spawned (GIL-free)")
 
-    cap     = find_camera(retries=15, delay=3.0)
+    # Wait for /dev/video0 to appear, then open by index
+    cap     = find_camera(retries=30, delay=3.0)
     capture = CaptureThread(cap)
     capture.start()
     print("[SUCCESS] Capture thread running")
