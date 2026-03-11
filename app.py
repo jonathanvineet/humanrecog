@@ -98,18 +98,8 @@ def index():
     return """<html><body><h1>Human Detection Stream</h1>
               <img src="/video_feed" width="640" height="480"></body></html>"""
 
-@app.route('/detections')
-def get_detections():
-    history = []
-    meta_dir = "detections/metadata"
-    if os.path.exists(meta_dir):
-        files = sorted(os.listdir(meta_dir), reverse=True)[:10]
-        for f in files:
-            try:
-                with open(os.path.join(meta_dir, f), 'r') as file:
-                    history.append(json.load(file))
-            except: pass
-    return json.dumps({"history": history})
-
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)

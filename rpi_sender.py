@@ -1,306 +1,155 @@
+#!/usr/bin/env python3
+"""
+RPi sender script to send frames from local detection to Vercel web app
+Place this in your humanrecog folder and run it on the RPi
+"""
+
 import os
 import time
 import cv2
-import subprocess
-import numpy as np
 import base64
-import json
-import random
-import threading
-import multiprocessing as mp
+import requests
+from threading import Thread
 from dotenv import load_dotenv
-from utils import get_current_location
-import paho.mqtt.client as mqtt
+from inference import get_model
 
-os.environ["OPENCV_VIDEOIO_PRIORITY_OBSENSOR"] = "0"
-os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"]     = "0"
-
+# =============================
+# Configuration
+# =============================
 load_dotenv()
 MODEL_ID = os.getenv("MODEL_ID")
-API_KEY  = os.getenv("ROBOFLOW_API_KEY")
+API_KEY = os.getenv("ROBOFLOW_API_KEY")
+VERCEL_APP_URL = os.getenv("VERCEL_APP_URL", "http://localhost:3000")  # Update this or add to .env
 
-MQTT_BROKER       = "broker.emqx.io"
-MQTT_PORT         = 1883
-MQTT_TOPIC        = "humanrecog/video/jonathan_feed"
-INFERENCE_EVERY_N = 12
+# =============================
+# Camera capture thread
+# =============================
+class CameraStream:
+    def __init__(self, src=0):
+        self.cap = cv2.VideoCapture(src)
+        self.frame = None
+        self.stopped = False
+        self.thread = Thread(target=self.update, daemon=True)
 
-# Camera confirmed: supports MJPEG 640x360 @ 30fps
-# MJPEG = compressed on-chip = much less USB bandwidth than YUYV
-WIDTH, HEIGHT = 640, 360
-CAM_FORMAT    = "mjpeg"
+    def start(self):
+        self.thread.start()
+        return self
 
-
-# ═══════════════════════════════════════════════════════════════════
-# CAMERA DETECTION
-# ═══════════════════════════════════════════════════════════════════
-def get_usb_camera_path() -> str | None:
-    try:
-        out = subprocess.check_output(
-            ["v4l2-ctl", "--list-devices"],
-            stderr=subprocess.DEVNULL, timeout=5
-        ).decode()
-    except Exception as e:
-        print(f"[CAM] v4l2-ctl failed: {e}")
-        return None
-
-    in_usb = False
-    for line in out.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            in_usb = False
-            continue
-        if not stripped.startswith("/dev/"):
-            in_usb = "usb" in stripped.lower()
-            continue
-        if in_usb and stripped.startswith("/dev/video"):
-            return stripped
-    return None
-
-
-def wait_for_camera(retries: int = 30, delay: float = 3.0) -> str:
-    print("[CAM] Waiting for USB camera...")
-    for attempt in range(retries):
-        path = get_usb_camera_path()
-        if path:
-            print(f"[CAM] Found: {path}")
-            return path
-        print(f"[CAM] Not found yet ({attempt+1}/{retries}), retrying in {delay}s...")
-        time.sleep(delay)
-    raise RuntimeError("[CAM] No USB camera found.")
-
-
-# ═══════════════════════════════════════════════════════════════════
-# FFMPEG CAPTURE THREAD
-# Uses MJPEG input (compressed on-chip) → decoded to raw BGR by ffmpeg
-# Completely bypasses OpenCV's broken obsensor plugin
-# ═══════════════════════════════════════════════════════════════════
-class FFmpegCaptureThread(threading.Thread):
-    def __init__(self, device: str):
-        super().__init__(daemon=True)
-        self.device  = device
-        self.frame   = None
-        self.lock    = threading.Lock()
-        self.running = True
-        self.process = None
-
-    def _build_cmd(self):
-        return [
-            "ffmpeg",
-            "-loglevel",      "error",
-            "-f",             "v4l2",
-            "-input_format",  CAM_FORMAT,        # mjpeg — native camera compression
-            "-video_size",    f"{WIDTH}x{HEIGHT}",
-            "-framerate",     "30",
-            "-i",             self.device,
-            "-f",             "rawvideo",
-            "-pix_fmt",       "bgr24",            # OpenCV-native
-            "pipe:1",
-        ]
-
-    def run(self):
-        frame_bytes = WIDTH * HEIGHT * 3
-        cmd         = self._build_cmd()
-        print(f"[CAM] Starting ffmpeg: {' '.join(cmd)}")
-
-        while self.running:
-            try:
-                self.process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    bufsize=frame_bytes * 4
-                )
-
-                while self.running:
-                    raw = self.process.stdout.read(frame_bytes)
-                    if len(raw) != frame_bytes:
-                        err = self.process.stderr.read(500).decode(errors="replace")
-                        print(f"[CAM] Pipe ended. stderr: {err.strip()}")
-                        break
-
-                    frame = np.frombuffer(raw, dtype=np.uint8).reshape((HEIGHT, WIDTH, 3))
-                    with self.lock:
-                        self.frame = frame
-
-            except Exception as e:
-                print(f"[CAM] Exception: {e}")
-
-            if self.process:
-                self.process.kill()
-                self.process = None
-
-            if self.running:
-                print("[CAM] Restarting ffmpeg in 2s...")
-                time.sleep(2)
-
-    def read(self):
-        with self.lock:
-            return self.frame.copy() if self.frame is not None else None
-
-    def stop(self):
-        self.running = False
-        if self.process:
-            self.process.kill()
-
-
-# ═══════════════════════════════════════════════════════════════════
-# INFERENCE PROCESS  (separate OS process — fully GIL-free)
-# ═══════════════════════════════════════════════════════════════════
-def inference_process_fn(frame_q: mp.Queue, result_q: mp.Queue, model_id: str, api_key: str):
-    from inference import get_model
-    model = get_model(model_id=model_id, api_key=api_key)
-    print("[INFERENCE PROC] Ready")
-
-    while True:
-        try:
-            frame = frame_q.get(timeout=2)
-        except Exception:
-            continue
-        try:
-            results    = model.infer(frame)[0]
-            boxes      = []
-            detections = 0
-            if hasattr(results, "predictions"):
-                for p in results.predictions:
-                    if p.class_name.lower() in ["person", "human"]:
-                        detections += 1
-                        x, y, w, h = int(p.x), int(p.y), int(p.width), int(p.height)
-                        boxes.append((int(x-w/2), int(y-h/2), int(x+w/2), int(y+h/2)))
-            while not result_q.empty():
-                try: result_q.get_nowait()
-                except: pass
-            result_q.put({"boxes": boxes, "detections": detections})
-        except Exception as e:
-            print(f"[INFERENCE PROC] Error: {e}")
-
-
-# ═══════════════════════════════════════════════════════════════════
-# CAPTURE THREAD
-# ═══════════════════════════════════════════════════════════════════
-class CaptureThread(threading.Thread):
-    def __init__(self, cap: cv2.VideoCapture):
-        super().__init__(daemon=True)
-        self.cap     = cap
-        self.frame   = None
-        self.lock    = threading.Lock()
-        self.running = True
-
-    def run(self):
-        while self.running:
+    def update(self):
+        while not self.stopped:
             ret, frame = self.cap.read()
             if ret:
-                with self.lock:
-                    self.frame = frame
+                self.frame = frame
 
     def read(self):
-        with self.lock:
-            return self.frame.copy() if self.frame is not None else None
+        return self.frame
 
     def stop(self):
-        self.running = False
+        self.stopped = True
+        self.cap.release()
 
 
-# ═══════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════
-def main():
-    print("[INFO] Starting GIL-free high-speed stream...")
-
-    frame_q  = mp.Queue(maxsize=1)
-    result_q = mp.Queue(maxsize=1)
-
-    inf_proc = mp.Process(
-        target=inference_process_fn,
-        args=(frame_q, result_q, MODEL_ID, API_KEY),
-        daemon=True
-    )
-    inf_proc.start()
-    print("[SUCCESS] Inference process spawned (GIL-free)")
-
-    device  = wait_for_camera(retries=30, delay=3.0)
-    capture = FFmpegCaptureThread(device)
-    capture.start()
-
-    print("[CAM] Waiting for first frame...")
-    for _ in range(60):
-        if capture.read() is not None:
-            break
-        time.sleep(0.5)
-    print("[SUCCESS] Camera stream live")
-
-    client = mqtt.Client()
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    client.loop_start()
-    print(f"[SUCCESS] MQTT tunnel open → {MQTT_BROKER}")
-
+def send_frame_to_vercel(frame_base64, detections_count):
+    """Send frame to Vercel API"""
     try:
-        base_lat, base_lng = get_current_location()
-        print(f"📍 Base coordinate: {base_lat:.10f}, {base_lng:.10f}")
-    except:
-        base_lat, base_lng = 12.9716, 77.5946
-    drift_lat, drift_lng = 0.0, 0.0
+        payload = {
+            "frameData": frame_base64,
+            "detections": detections_count,
+            "timestamp": int(time.time() * 1000),
+        }
+        
+        response = requests.post(
+            f"{VERCEL_APP_URL}/api/upload-frame",
+            json=payload,
+            timeout=5
+        )
+        
+        if response.status_code == 200:
+            print(f"✓ Frame sent successfully ({detections_count} detections)")
+        else:
+            print(f"✗ Failed to send frame: {response.status_code}")
+    except Exception as e:
+        print(f"✗ Error sending frame: {e}")
 
-    cached_boxes      = []
-    cached_detections = 0
-    frame_count       = 0
-    fps_count         = 0
-    fps_timer         = time.time()
 
-    while True:
-        frame = capture.read()
-        if frame is None:
-            time.sleep(0.001)
-            continue
-
-        frame_count += 1
-
-        if not result_q.empty():
-            try:
-                res               = result_q.get_nowait()
-                cached_boxes      = res["boxes"]
-                cached_detections = res["detections"]
-            except:
-                pass
-
-        if frame_count % INFERENCE_EVERY_N == 0:
-            if not frame_q.full():
-                try: frame_q.put_nowait(frame.copy())
-                except: pass
-
-        for (x1, y1, x2, y2) in cached_boxes:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, "HUMAN", (x1, y1 - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
-
-        _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
-        frame_b64 = base64.b64encode(buffer).decode('utf-8')
-
-        drift_lat += random.uniform(-0.00005, 0.00005)
-        drift_lng += random.uniform(-0.00005, 0.00005)
-        lat = base_lat + drift_lat
-        lng = base_lng + drift_lng
-
-        payload = json.dumps({
-            "frameData":  f"data:image/jpeg;base64,{frame_b64}",
-            "detections": cached_detections,
-            "timestamp":  int(time.time() * 1000),
-            "location":   {
-                "lat": float(f"{lat:.10f}"),
-                "lng": float(f"{lng:.10f}"),
-            },
-        })
-        client.publish(MQTT_TOPIC, payload, qos=0)
-
-        fps_count += 1
-        elapsed = time.time() - fps_timer
-        if elapsed >= 3.0:
-            print(f"📡 {fps_count/elapsed:.1f} fps  |  {cached_detections} det  |  {lat:.6f}, {lng:.6f}")
-            fps_count = 0
-            fps_timer = time.time()
-
-        time.sleep(0.001)
+def main():
+    print("[INFO] Starting RPi camera stream sender...")
+    
+    # Setup camera
+    camera = CameraStream(0).start()
+    time.sleep(2)  # Wait for camera to warm up
+    
+    print("[INFO] Loading model...")
+    model = get_model(model_id=MODEL_ID, api_key=API_KEY)
+    
+    print(f"[INFO] Sending frames to: {VERCEL_APP_URL}")
+    print("[INFO] Press Ctrl+C to stop")
+    
+    frame_count = 0
+    
+    try:
+        while True:
+            frame = camera.read()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+            
+            frame_count += 1
+            
+            # Run inference every 5 frames
+            if frame_count % 5 == 0:
+                try:
+                    # Draw on frame
+                    display_frame = frame.copy()
+                    results = model.infer(frame)[0]
+                    detections_count = 0
+                    
+                    if hasattr(results, "predictions"):
+                        for prediction in results.predictions:
+                            if prediction.class_name.lower() in ["person", "human"]:
+                                detections_count += 1
+                                
+                                x = int(prediction.x)
+                                y = int(prediction.y)
+                                w = int(prediction.width)
+                                h = int(prediction.height)
+                                x1 = int(x - w/2)
+                                y1 = int(y - h/2)
+                                x2 = int(x + w/2)
+                                y2 = int(y + h/2)
+                                
+                                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                cv2.putText(
+                                    display_frame,
+                                    f"{prediction.class_name} {prediction.confidence:.2f}",
+                                    (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6,
+                                    (0, 255, 0),
+                                    2,
+                                )
+                    
+                    # Encode frame to base64
+                    ret, buffer = cv2.imencode('.jpg', display_frame)
+                    frame_base64 = base64.b64encode(buffer).decode('utf-8')
+                    
+                    # Send to Vercel in a separate thread (non-blocking)
+                    Thread(
+                        target=send_frame_to_vercel,
+                        args=(f"data:image/jpeg;base64,{frame_base64}", detections_count),
+                        daemon=True
+                    ).start()
+                    
+                except Exception as e:
+                    print(f"[ERROR] Inference error: {e}")
+            
+            time.sleep(0.01)
+            
+    except KeyboardInterrupt:
+        print("\n[INFO] Stopping...")
+        camera.stop()
+        print("[INFO] Done!")
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
     main()
